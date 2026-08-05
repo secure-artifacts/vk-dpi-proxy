@@ -1,0 +1,91 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: vk-dpi-proxy-linux.zip
+          - os: windows-latest
+            artifact_name: vk-dpi-proxy-windows.exe
+          - os: macos-latest
+            artifact_name: vk-dpi-proxy-macos.zip
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: pip install pyinstaller
+
+      # Linux: 单文件可执行，打包为 zip 保留权限
+      - name: Build Executable (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onefile --name "vk-dpi-proxy-linux" --add-data "proxy.pac:." dpi_proxy.py
+          mkdir -p dist_final
+          chmod +x dist/vk-dpi-proxy-linux
+          cd dist && zip ../dist_final/vk-dpi-proxy-linux.zip vk-dpi-proxy-linux
+
+      # macOS: 必须用 --onedir 生成 .app 包，再打包为 zip
+      - name: Build Executable (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onedir --windowed --name "vk-dpi-proxy" --add-data "proxy.pac:." dpi_proxy.py
+          mkdir -p dist_final
+          cd dist && zip -r ../dist_final/vk-dpi-proxy-macos.zip vk-dpi-proxy.app
+
+      # Windows: 直接生成 .exe
+      - name: Build Executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onefile --windowed --name "vk-dpi-proxy-windows" --add-data "proxy.pac;." dpi_proxy.py
+          mkdir dist_final
+          copy dist\vk-dpi-proxy-windows.exe dist_final\
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist_final/*'
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist_final/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
