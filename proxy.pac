@@ -34,8 +34,11 @@ function FindProxyForURL(url, host) {
         "vkontakte.ru",
         "vkontakte.com",
         "vkcc.com",
-        "vk.link"
-    ];
+  "vk.link",
+  "mycdn.me",
+  "okcdn.ru",
+  "vkuser.net"
+];
 
     for (var i = 0; i < domains.length; i++) {
         if (hostMatches(host, domains[i])) {

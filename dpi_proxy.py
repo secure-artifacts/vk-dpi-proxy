@@ -7,8 +7,10 @@ stdlib only — Windows / macOS / Linux.
 
 from __future__ import annotations
 
+import concurrent.futures
 import ipaddress
 import os
+import random
 import re
 import select
 import socket
@@ -46,16 +48,112 @@ def _app_dir() -> Path:
 APP_DIR = _app_dir()
 PAC_FILE = APP_DIR / "proxy.pac"
 PAC_URL = f"http://{LISTEN_HOST}:{PAC_PORT}/proxy.pac"
-# "split" = 2 records (compatible, recommended)
-# "fine"  = 1–2 byte records (aggressive)
-FRAGMENT_MODE = "split"
+# "split" = 2 records (fast, often enough)
+# "multi" = ~40B chunks (balanced)
+# "fine"  = 1-byte records (very slow; last resort)
+FRAGMENT_MODE = "multi"
 FINE_SIZE = 2
-SPLIT_FIRST = 1  # first TLS record payload size (bytes of handshake body)
+SPLIT_FIRST = 1
+MULTI_SIZE = 40
 
-SO_TIMEOUT = 45
+SO_TIMEOUT = 60
+CONNECT_TIMEOUT = 2.5  # try next IP quickly
+PIPE_IDLE = 600        # longpoll / websocket may sit idle for minutes
 PIPE_BUF = 65536
 HELLO_MAX = 64 * 1024
 
+# Destination IPs / prefixes that blackhole TCP from this network.
+BLOCKED_IP_PREFIXES = (
+    "95.142.204.",  # subset of sun1-* / st1-* storage edges
+)
+# Filled at runtime when connect times out — covers one-off bad edges
+# like 195.3.244.42 without over-blocking whole ranges.
+_runtime_blocked_ips: set[str] = set()
+# CDN object hosts (avatars/static). Do NOT blanket-force-rewrite these:
+# many sun1-*/st1-* resolve to working 87.240.* — rewriting those blanks avatars.
+_CDN_STORAGE_HOST = re.compile(
+    r"^(sun\d+-\d+|st\d+-\d+)\.(userapi\.com|vk\.ru|vk\.com)$",
+    re.I,
+)
+# Long-lived IM / queue sockets: heavy multi fragment often stalls the tab spinner.
+_MESSAGING_HOST = re.compile(
+    r"^(im|queuev?\d*|queue|pubsub|notify|sapi)[\.-]",
+    re.I,
+)
+
+# When a VK CDN IP is firewalled, dial a working peer that still presents
+# a valid cert for the original SNI. Pools are family-specific:
+# userapi.com avatars must NOT fall back to vk.com edges (wrong cert / empty).
+FALLBACK_SEEDS = {
+    "userapi": (
+        # Gateway edges: accept other sun*-SNI and 301 → pp.userapi.com (full image).
+        "uk.userapi.com",
+        "ppu.userapi.com",
+        "sun1-1.userapi.com",
+        "sun1-2.userapi.com",
+        "sun1-3.userapi.com",
+        "sun1-10.userapi.com",
+        "sun1-50.userapi.com",
+        "sun1-60.userapi.com",
+        "sun1-76.userapi.com",
+        "sun1-100.userapi.com",
+        "sun1-120.userapi.com",
+        "sun6-1.userapi.com",
+        "pp.userapi.com",
+        "sun9-16.userapi.com",
+        "sun9-22.userapi.com",
+        "sun9-50.userapi.com",
+        "sun9-60.userapi.com",
+        "sun9-76.userapi.com",
+        "sun2-10.userapi.com",
+        "sun2-20.userapi.com",
+        "sun8-1.userapi.com",
+    ),
+    "vk": (
+        "st1-1.vk.ru",
+        "st1-2.vk.ru",
+        "st1-10.vk.ru",
+        "st1-50.vk.ru",
+        "st1-100.vk.ru",
+        "st.vk.ru",
+        "vk.com",
+        "vk.ru",
+        "login.vk.ru",
+        "api.vk.com",
+    ),
+    "mycdn": ("mycdn.me",),
+    "okcdn": ("okcdn.ru",),
+}
+# Seeds whose IPs 301 foreign sun*-SNI to pp (do NOT put pp/sun9 IPs first).
+_USERAPI_GATEWAY_SEEDS = (
+    "uk.userapi.com",
+    "ppu.userapi.com",
+    "sun1-1.userapi.com",
+    "sun1-50.userapi.com",
+    "sun6-1.userapi.com",
+)
+# IPs from these often 403 when SNI is another sun*-host → blank/blurry avatars.
+_USERAPI_DEPRIORITIZE_SEEDS = (
+    "pp.userapi.com",
+    "sun9-16.userapi.com",
+    "sun9-22.userapi.com",
+    "sun9-50.userapi.com",
+    "sun9-60.userapi.com",
+    "sun9-76.userapi.com",
+    "sun2-10.userapi.com",
+    "sun2-20.userapi.com",
+    "sun8-1.userapi.com",
+)
+_fallback_pools: dict[str, list[str]] = {}
+_fallback_pool_ts: dict[str, float] = {}
+_FALLBACK_TTL = 300.0
+_fallback_lock = threading.Lock()
+_fallback_building: dict[str, threading.Event] = {}
+# sun1 / st1 / … → IPs learned from working seeds of that shard only
+_shard_edges: dict[str, list[str]] = {}
+_userapi_gateway_ips: list[str] = []
+_userapi_deprioritize_ips: set[str] = set()
+_SHARD_RE = re.compile(r"^(sun\d+|st\d+)-", re.I)
 TARGET_SUFFIXES = (
     "vk.com",
     "vk.ru",
@@ -64,6 +162,7 @@ TARGET_SUFFIXES = (
     "vk-cdn.net",
     "vk-cdn.me",
     "vkuservideo.net",
+    "vkuservideo.com",
     "vkuseraudio.net",
     "vkuserlive.net",
     "vk-portal.net",
@@ -72,6 +171,9 @@ TARGET_SUFFIXES = (
     "vkontakte.com",
     "vkcc.com",
     "vk.link",
+    "mycdn.me",
+    "okcdn.ru",
+    "vkuser.net",
 )
 
 CONNECT_RE = re.compile(
@@ -197,6 +299,11 @@ def fragment_client_hello(data: bytes, mode: str = FRAGMENT_MODE) -> list[bytes]
         for i in range(0, len(handshake), size):
             piece = handshake[i : i + size]
             out.append(content_type + version + len(piece).to_bytes(2, "big") + piece)
+    elif mode == "multi":
+        size = max(8, MULTI_SIZE)
+        for i in range(0, len(handshake), size):
+            piece = handshake[i : i + size]
+            out.append(content_type + version + len(piece).to_bytes(2, "big") + piece)
     else:
         # Two-record split (SpoofDPI-style): tiny head + remainder
         n = min(max(1, SPLIT_FIRST), len(handshake) - 1) if len(handshake) > 1 else 1
@@ -210,39 +317,364 @@ def fragment_client_hello(data: bytes, mode: str = FRAGMENT_MODE) -> list[bytes]
     return out
 
 
-def connect_remote(host: str, port: int) -> socket.socket:
-    """Prefer IPv4 — some ISPs treat AAAA paths differently."""
-    last_err: Optional[Exception] = None
-    try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    except socket.gaierror:
-        infos = []
-    if not infos:
-        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+def send_parts(remote: socket.socket, parts: list[bytes]) -> None:
+    """Send TLS fragments; lightly TCP-split the first record only."""
+    for i, part in enumerate(parts):
+        if i == 0 and len(part) > 8:
+            remote.sendall(part[:5])
+            time.sleep(0.008)
+            remote.sendall(part[5:])
+        else:
+            remote.sendall(part)
+        if i == 0 and len(parts) > 1:
+            time.sleep(0.008)
 
+
+def _shard_key(host: str) -> Optional[str]:
+    m = _SHARD_RE.match(host.lower().rstrip("."))
+    return m.group(1).lower() if m else None
+
+
+def _cdn_family_for(host: str) -> str:
+    h = host.lower().rstrip(".")
+    if h == "userapi.com" or h.endswith(".userapi.com"):
+        return "userapi"
+    if h == "mycdn.me" or h.endswith(".mycdn.me"):
+        return "mycdn"
+    if h == "okcdn.ru" or h.endswith(".okcdn.ru"):
+        return "okcdn"
+    return "vk"
+
+
+def _probe_ip(ip: str) -> Optional[str]:
+    if is_blocked_ip(ip):
+        return None
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.9)
+        probe.connect((ip, 443))
+        return ip
+    except OSError:
+        return None
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+
+
+def _build_fallback_pool(kind: str) -> list[str]:
+    """Resolve + probe seed hosts; remember per-shard / gateway edges."""
+    seeds = FALLBACK_SEEDS.get(kind, ())
+    seed_ips: list[tuple[str, str]] = []
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for name in seeds:
+        try:
+            infos = socket.getaddrinfo(name, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+        for *_, sockaddr in infos:
+            ip = sockaddr[0]
+            if ip in seen or is_blocked_ip(ip):
+                continue
+            seen.add(ip)
+            candidates.append(ip)
+            seed_ips.append((name, ip))
+
+    found: list[str] = []
+    if candidates:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, len(candidates))
+        ) as pool:
+            for ip in pool.map(_probe_ip, candidates):
+                if ip:
+                    found.append(ip)
+
+    ok = set(found)
+    shard_acc: dict[str, list[str]] = {}
+    gateway: list[str] = []
+    deprioritize: set[str] = set()
+    for name, ip in seed_ips:
+        if ip not in ok:
+            continue
+        sk = _shard_key(name)
+        if sk:
+            bucket = shard_acc.setdefault(sk, [])
+            if ip not in bucket:
+                bucket.append(ip)
+        if kind == "userapi":
+            if name in _USERAPI_GATEWAY_SEEDS and ip not in gateway:
+                gateway.append(ip)
+            if name in _USERAPI_DEPRIORITIZE_SEEDS:
+                deprioritize.add(ip)
+
+    with _fallback_lock:
+        for sk, iplist in shard_acc.items():
+            _shard_edges[sk] = iplist
+        if kind == "userapi":
+            # Gateway wins over deprioritize if an IP appears in both
+            _userapi_gateway_ips[:] = gateway
+            _userapi_deprioritize_ips.clear()
+            _userapi_deprioritize_ips.update(deprioritize - set(gateway))
+    return found
+
+
+def refresh_fallback_pool(kind: str) -> list[str]:
+    """
+    Resolve seed hostnames for a CDN family; keep only quick-connectable IPs.
+    Single-flight: concurrent avatar CONNECTs wait on one build instead of
+    each probing all seeds (that race made direct Messages blank).
+    """
+    now_ts = time.time()
+    with _fallback_lock:
+        cached = _fallback_pools.get(kind)
+        if cached and now_ts - _fallback_pool_ts.get(kind, 0) < _FALLBACK_TTL:
+            return list(cached)
+        waiter = _fallback_building.get(kind)
+        if waiter is not None:
+            builder = False
+        else:
+            waiter = threading.Event()
+            _fallback_building[kind] = waiter
+            builder = True
+
+    if not builder:
+        waiter.wait(timeout=12.0)
+        with _fallback_lock:
+            return list(_fallback_pools.get(kind, []))
+
+    try:
+        found = _build_fallback_pool(kind)
+        with _fallback_lock:
+            _fallback_pools[kind] = found
+            _fallback_pool_ts[kind] = time.time()
+        return list(found)
+    finally:
+        with _fallback_lock:
+            _fallback_building.pop(kind, None)
+        waiter.set()
+
+
+def fallback_ips_for(host: str) -> list[str]:
+    """
+    Pick rewrite candidates.
+    For sun*-*.userapi.com: gateway IPs first (301→pp), then same-shard,
+    and keep pp/sun9 IPs last (foreign SNI → 403 → blank avatar).
+    """
+    kind = _cdn_family_for(host)
+    ips = refresh_fallback_pool(kind)
+    if kind in ("mycdn", "okcdn") and not ips:
+        ips = refresh_fallback_pool("vk")
+
+    h = host.lower().rstrip(".")
+    sk = _shard_key(h)
+    prefer: list[str] = []
+    middle: list[str] = []
+    last: list[str] = []
+
+    with _fallback_lock:
+        gateway = list(_userapi_gateway_ips)
+        deprioritize = set(_userapi_deprioritize_ips)
+        shard = list(_shard_edges.get(sk, [])) if sk else []
+
+    if kind == "userapi" and sk and sk.startswith("sun"):
+        for ip in gateway:
+            if ip in ips and ip not in prefer:
+                prefer.append(ip)
+        for ip in shard:
+            if ip in ips and ip not in prefer:
+                prefer.append(ip)
+        for ip in ips:
+            if ip in prefer:
+                continue
+            if ip in deprioritize:
+                last.append(ip)
+            else:
+                middle.append(ip)
+        if len(prefer) > 1:
+            # keep gateway order stable; only shuffle non-gateway prefer tail
+            head = [ip for ip in prefer if ip in gateway]
+            tail = [ip for ip in prefer if ip not in gateway]
+            random.shuffle(tail)
+            prefer = head + tail
+        random.shuffle(middle)
+        random.shuffle(last)
+        return prefer + middle + last
+
+    if sk:
+        prefer = [ip for ip in shard if ip in ips]
+    rest = [ip for ip in ips if ip not in prefer]
+    if len(prefer) > 1:
+        random.shuffle(prefer)
+    if len(rest) > 1:
+        random.shuffle(rest)
+    return prefer + rest
+def is_blocked_ip(ip: str) -> bool:
+    ip = str(ip)
+    if ip in _runtime_blocked_ips:
+        return True
+    return any(ip.startswith(p) for p in BLOCKED_IP_PREFIXES)
+
+
+def mark_ip_blocked(ip: str, log: Optional[Callable[[str], None]] = None) -> None:
+    ip = str(ip)
+    if ip in _runtime_blocked_ips or any(ip.startswith(p) for p in BLOCKED_IP_PREFIXES):
+        return
+    _runtime_blocked_ips.add(ip)
+    if log:
+        log(f"[{now()}] [BLOCK-LEARN] marked {ip} as blocked for this session")
+
+
+def _should_learn_native_block(ip: str, host: str) -> bool:
+    """
+    Only learn-block CDN storage edges. Never poison core vk/login IPs or
+    shared fallback pools — one transient timeout there kills messaging.
+    """
+    if any(ip.startswith(p) for p in BLOCKED_IP_PREFIXES):
+        return False  # already covered by prefix
+    if _CDN_STORAGE_HOST.match(host):
+        return True
+    return ip.startswith("95.142.") or ip.startswith("195.3.244.")
+
+
+def _dial(ip: str, port: int, family: int = socket.AF_INET) -> socket.socket:
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.settimeout(CONNECT_TIMEOUT)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.connect((ip, port))
+    s.settimeout(SO_TIMEOUT)
+    return s
+
+
+def connect_remote(
+    host: str, port: int, log: Optional[Callable[[str], None]] = None
+) -> tuple[socket.socket, bool]:
+    """
+    Connect to host:port.
+    Returns (socket, rewritten). rewritten=True means we dialed a same-family
+    fallback IP because the native CDN address is blocked.
+    """
+    last_err: Optional[Exception] = None
+    tried: list[str] = []
+
+    infos: list = []
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            got = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            last_err = exc
+            continue
+        for item in got:
+            if item not in infos:
+                infos.append(item)
+
+    seen = set()
+    ordered = []
     for family, socktype, proto, _, sockaddr in infos:
+        key = (family, sockaddr[0], sockaddr[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((family, socktype, proto, sockaddr))
+
+    native_ips = [str(sa[0]) for *_, sa in ordered]
+    # Only rewrite when EVERY native IP is known-blocked. Many sun1-*/st1-*
+    # still land on working 87.240.* — those must stay native.
+    if (
+        port == 443
+        and is_target_host(host)
+        and bool(native_ips)
+        and all(is_blocked_ip(ip) for ip in native_ips)
+    ):
+        if log:
+            log(
+                f"[{now()}] [REWRITE-SKIP-NATIVE] {host} "
+                f"native={','.join(native_ips[:4])}"
+            )
+        return _connect_fallback(host, port, tried + native_ips, last_err, log)
+
+    for family, socktype, proto, sockaddr in ordered:
+        ip = str(sockaddr[0])
+        tried.append(ip)
+        if is_blocked_ip(ip):
+            last_err = TimeoutError(f"known-blocked prefix {ip}")
+            continue
         s = socket.socket(family, socktype, proto)
         try:
-            s.settimeout(SO_TIMEOUT)
+            s.settimeout(CONNECT_TIMEOUT)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.connect(sockaddr)
-            return s
+            s.settimeout(SO_TIMEOUT)
+            return s, False
         except OSError as exc:
             last_err = exc
+            timed_out = (
+                isinstance(exc, (TimeoutError, socket.timeout))
+                or "timed out" in str(exc).lower()
+            )
+            if timed_out and _should_learn_native_block(ip, host):
+                mark_ip_blocked(ip, log)
             try:
                 s.close()
             except OSError:
                 pass
-    raise OSError(f"connect failed for {host}:{port}: {last_err}")
+
+    if port == 443 and is_target_host(host):
+        return _connect_fallback(host, port, tried, last_err, log)
+
+    raise OSError(
+        f"connect failed for {host}:{port} via {', '.join(tried[:10])}: {last_err}"
+    )
+
+
+def _connect_fallback(
+    host: str,
+    port: int,
+    tried: list[str],
+    last_err: Optional[Exception],
+    log: Optional[Callable[[str], None]],
+) -> tuple[socket.socket, bool]:
+    candidates = fallback_ips_for(host)
+    if not candidates:
+        raise OSError(
+            f"connect failed for {host}:{port} via {', '.join(tried[:10])}: "
+            f"no CDN fallback IPs ({last_err})"
+        )
+    for ip in candidates:
+        tag = f"{ip}(fallback)"
+        if ip in tried or tag in tried or is_blocked_ip(ip):
+            continue
+        tried.append(tag)
+        try:
+            sock = _dial(ip, port)
+            if log:
+                log(f"[{now()}] [REWRITE] {host} -> {ip} (CDN IP blocked)")
+            return sock, True
+        except OSError as exc:
+            last_err = exc
+
+    raise OSError(
+        f"connect failed for {host}:{port} via {', '.join(tried[:10])}: {last_err}"
+    )
 
 
 def pipe_bidirectional(a: socket.socket, b: socket.socket) -> None:
+    """Relay bytes both ways. Idle is normal for VK longpoll / WebSocket."""
+    # Blocking sockets: a 60s SO_TIMEOUT during idle longpoll kills Messages.
+    for s in (a, b):
+        try:
+            s.settimeout(None)
+        except OSError:
+            pass
     sockets = [a, b]
     try:
         while True:
-            readable, _, errored = select.select(sockets, [], sockets, SO_TIMEOUT)
-            if errored or not readable:
-                break
+            readable, _, errored = select.select(sockets, [], sockets, PIPE_IDLE)
+            if errored:
+                return
+            if not readable:
+                continue
             for s in readable:
                 other = b if s is a else a
                 try:
@@ -449,10 +881,11 @@ class FragmentProxy:
             self._thread.join(timeout=2)
 
         self._stop.clear()
+
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
-        srv.listen(128)
+        srv.listen(256)
         srv.settimeout(0.5)
         self._sock = srv
         self._thread = threading.Thread(
@@ -460,6 +893,19 @@ class FragmentProxy:
         )
         self._thread.start()
         self.log(f"[{now()}] Proxy listening on {self.host}:{self.port}  mode={self.mode}")
+
+        def _prewarm() -> None:
+            try:
+                u = refresh_fallback_pool("userapi")
+                v = refresh_fallback_pool("vk")
+                self.log(
+                    f"[{now()}] CDN fallback ready: userapi={len(u)} ips, vk={len(v)} ips"
+                )
+            except Exception as exc:
+                self.log(f"[{now()}] CDN fallback warmup failed: {exc}")
+
+        self.log(f"[{now()}] Warming CDN fallback pools…")
+        threading.Thread(target=_prewarm, name="cdn-warmup", daemon=True).start()
 
     def stop(self) -> None:
         """Stop accepting and cut all live tunnels (so browser notices immediately)."""
@@ -549,12 +995,14 @@ class FragmentProxy:
         mode = "FRAGMENT" if bypass else "PASS"
         self.log(f"[{now()}] [{mode}] CONNECT {host}:{port}  (active={active})")
 
-        remote = connect_remote(host, port)
+        remote, _rewritten = connect_remote(host, port, self.log)
         self._track(remote)
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
         if bypass:
-            self._fragment_then_pipe(client, remote, host)
+            # IM/queue WebSockets tolerate light split better than multi/fine.
+            mode_override = "split" if _MESSAGING_HOST.match(host) else None
+            self._fragment_then_pipe(client, remote, host, mode_override=mode_override)
         else:
             pipe_bidirectional(client, remote)
         return remote
@@ -580,6 +1028,21 @@ class FragmentProxy:
             if parts.query:
                 path += "?" + parts.query
 
+        # Local health check for the browser extension popup
+        path_only = path.split("?", 1)[0]
+        if path_only in ("/health", "/health/") or (
+            host in ("127.0.0.1", "localhost") and path_only in ("/", "/health", "/health/")
+        ):
+            body = b"OK"
+            client.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            return None
+
         if is_target_host(host) and port == 80:
             loc = f"https://{host}{path}".encode("ascii", errors="ignore")
             client.sendall(
@@ -592,14 +1055,18 @@ class FragmentProxy:
             return None
 
         self.log(f"[{now()}] [HTTP-PASS] {host}:{port}  (active={active})")
-        remote = connect_remote(host, port)
+        remote, _rewritten = connect_remote(host, port, self.log)
         self._track(remote)
         remote.sendall(req)
         pipe_bidirectional(client, remote)
         return remote
 
     def _fragment_then_pipe(
-        self, client: socket.socket, remote: socket.socket, host: str
+        self,
+        client: socket.socket,
+        remote: socket.socket,
+        host: str,
+        mode_override: Optional[str] = None,
     ) -> None:
         try:
             first = recv_tls_records(client)
@@ -609,18 +1076,16 @@ class FragmentProxy:
         if not first:
             return
 
+        mode = mode_override or self.mode
         if first[0:1] == b"\x16":
-            parts = fragment_client_hello(first, self.mode)
+            parts = fragment_client_hello(first, mode)
             self.log(
                 f"[{now()}] Fragmented → {host} "
-                f"({len(first)} B → {len(parts)} rec, mode={self.mode})"
+                f"({len(first)} B → {len(parts)} rec, mode={mode})"
             )
-            for i, part in enumerate(parts):
-                if self._stop.is_set():
-                    return
-                remote.sendall(part)
-                if i == 0:
-                    time.sleep(0.005)
+            if self._stop.is_set():
+                return
+            send_parts(remote, parts)
         else:
             remote.sendall(first)
 
@@ -635,8 +1100,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("VK DPI Bypass Proxy")
-        self.geometry("740x560")
-        self.minsize(560, 420)
+        self.geometry("760x620")
+        self.minsize(580, 480)
 
         self.proxy = FragmentProxy(LISTEN_HOST, LISTEN_PORT, self._ui_log)
         self.pac = PacServer(LISTEN_HOST, PAC_PORT, PAC_FILE, self._ui_log)
@@ -648,12 +1113,16 @@ class App(tk.Tk):
         top.pack(fill=tk.X)
 
         ui_font = (
-            ("Segoe UI", 11, "bold")
-            if "Segoe UI" in tkfont.families()
-            else ("Helvetica", 11, "bold")
+            ("Microsoft YaHei UI", 11, "bold")
+            if "Microsoft YaHei UI" in tkfont.families()
+            else (
+                ("Segoe UI", 11, "bold")
+                if "Segoe UI" in tkfont.families()
+                else ("Helvetica", 11, "bold")
+            )
         )
         tk.Label(
-            top, text=f"Local proxy  {LISTEN_HOST}:{LISTEN_PORT}", font=ui_font
+            top, text=f"本地代理  {LISTEN_HOST}:{LISTEN_PORT}", font=ui_font
         ).pack(side=tk.LEFT)
 
         self.btn_start = tk.Button(top, text="启动", width=10, command=self._start)
@@ -662,12 +1131,37 @@ class App(tk.Tk):
             top, text="停止", width=10, command=self._stop, state=tk.DISABLED
         )
         self.btn_stop.pack(side=tk.RIGHT)
+        tk.Button(top, text="使用说明", width=10, command=self._show_usage).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        guide = tk.LabelFrame(self, text=" 使用说明（新手看这里） ", padx=10, pady=8)
+        guide.pack(fill=tk.X, padx=10, pady=(0, 6))
+        tk.Label(
+            guide,
+            justify=tk.LEFT,
+            anchor="w",
+            text=(
+                "① 点右上角「启动」，状态变成绿色「运行中」\n"
+                "② 浏览器打开插件 VK DPI Proxy Helper，点「开启」（角标显示 ON）\n"
+                "③ 打开 https://vk.com 或 https://vk.ru\n"
+                "④ 不用时：插件点「关闭」→ 软件点「停止」\n"
+                "\n"
+                "记住：软件 + 插件 两个都要开。只开一个会转圈或打不开。\n"
+                "不要开系统全局代理。分段模式选「中等 multi」即可。\n"
+                "聊天图若仍模糊：高清文件只在被封节点上时无法拉清，可点图看是否能加载。"
+            ),
+        ).pack(fill=tk.X)
 
         mode_row = tk.Frame(self, padx=10)
         mode_row.pack(fill=tk.X)
         tk.Label(mode_row, text="分段模式:").pack(side=tk.LEFT)
         self.mode_var = tk.StringVar(value=FRAGMENT_MODE)
-        for label, val in (("稳妥 split", "split"), ("激进 fine", "fine")):
+        for label, val in (
+            ("中等 multi（推荐）", "multi"),
+            ("稳妥 split", "split"),
+            ("激进 fine（很慢）", "fine"),
+        ):
             tk.Radiobutton(
                 mode_row,
                 text=label,
@@ -676,30 +1170,18 @@ class App(tk.Tk):
                 command=self._on_mode,
             ).pack(side=tk.LEFT, padx=(8, 0))
 
-        info = tk.Label(
-            self,
-            justify=tk.LEFT,
-            anchor="w",
-            padx=10,
-            text=(
-                "不要用「全部手动代理」——会把 YouTube 等网站也塞进来。\n"
-                "正确用法：启动后点「仅代理 VK」，看完 VK 再点「恢复直连」。"
-            ),
-        )
-        info.pack(fill=tk.X)
-
         self.status = tk.Label(self, text="状态: 已停止", anchor="w", padx=10, fg="#a33")
         self.status.pack(fill=tk.X)
 
         self.log_box = scrolledtext.ScrolledText(
-            self, height=18, state=tk.DISABLED, wrap=tk.WORD
+            self, height=16, state=tk.DISABLED, wrap=tk.WORD
         )
         self.log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 8))
 
         win_row = tk.Frame(self)
         win_row.pack(pady=(0, 4))
         tk.Button(
-            win_row, text="仅代理 VK（推荐）", width=18, command=self._enable_vk_only
+            win_row, text="仅代理 VK（系统 PAC）", width=20, command=self._enable_vk_only
         ).pack(side=tk.LEFT, padx=4)
         tk.Button(
             win_row, text="恢复直连（修 YouTube）", width=20, command=self._disable_sys_proxy
@@ -707,7 +1189,10 @@ class App(tk.Tk):
 
         btns = tk.Frame(self)
         btns.pack(pady=(0, 10))
-        tk.Button(btns, text="浏览器配置说明", command=self._show_help).pack(
+        tk.Button(btns, text="使用说明", width=12, command=self._show_usage).pack(
+            side=tk.LEFT, padx=4
+        )
+        tk.Button(btns, text="浏览器高级配置", command=self._show_help).pack(
             side=tk.LEFT, padx=4
         )
         tk.Button(btns, text="修复重定向问题", command=self._show_redirect_help).pack(
@@ -717,14 +1202,10 @@ class App(tk.Tk):
             side=tk.LEFT, padx=4
         )
 
+        self._ui_log(f"[{now()}] Ready. 点「使用说明」可再次查看步骤。")
         self._ui_log(
-            f"[{now()}] Ready. 启动后监听 {LISTEN_HOST}:{LISTEN_PORT}"
+            f"[{now()}] 推荐：本软件「启动」+ 浏览器插件「开启」（比系统 PAC 更安全）。"
         )
-        if sys.platform == "win32":
-            self._ui_log(
-                f"[{now()}] Tip: 点「仅代理 VK」→ 浏览器访问 vk.com；"
-                "YouTube 异常时点「恢复直连」。"
-            )
     def _on_mode(self) -> None:
         self.proxy.mode = self.mode_var.get()
         self._ui_log(f"[{now()}] Fragment mode → {self.proxy.mode}")
@@ -825,6 +1306,23 @@ class App(tk.Tk):
             self.proxy.stop()
         self.pac.stop()
         self.destroy()
+
+    def _show_usage(self) -> None:
+        messagebox.showinfo(
+            "使用说明",
+            "三步就会用：\n\n"
+            "① 本软件点「启动」→ 状态显示「运行中」\n"
+            "② 浏览器插件点「开启」→ 角标显示 ON\n"
+            "③ 打开 https://vk.com 或 https://vk.ru\n\n"
+            "不用时：\n"
+            "· 插件点「关闭」\n"
+            "· 软件点「停止」\n\n"
+            "注意：\n"
+            "· 软件和插件必须同时开，缺一不可\n"
+            "· 只开插件不开软件 = 一直转圈\n"
+            "· 不要开系统「全部网站」代理（会搞坏 YouTube）\n"
+            "· 分段模式选「中等 multi」即可",
+        )
 
     def _show_need_proxy(self) -> None:
         messagebox.showinfo(
