@@ -48,10 +48,10 @@ def _app_dir() -> Path:
 APP_DIR = _app_dir()
 PAC_FILE = APP_DIR / "proxy.pac"
 PAC_URL = f"http://{LISTEN_HOST}:{PAC_PORT}/proxy.pac"
-# "split" = 2 records (fast, often enough)
-# "multi" = ~40B chunks (balanced)
+# "split" = 2 records (fast, recommended for images / chat)
+# "multi" = ~40B chunks (stronger DPI bypass, heavier)
 # "fine"  = 1-byte records (very slow; last resort)
-FRAGMENT_MODE = "multi"
+FRAGMENT_MODE = "split"
 FINE_SIZE = 2
 SPLIT_FIRST = 1
 MULTI_SIZE = 40
@@ -65,6 +65,7 @@ HELLO_MAX = 64 * 1024
 # Destination IPs / prefixes that blackhole TCP from this network.
 BLOCKED_IP_PREFIXES = (
     "95.142.204.",  # subset of sun1-* / st1-* storage edges
+    "195.3.244.",   # some sun10-* edges
 )
 # Filled at runtime when connect times out — covers one-off bad edges
 # like 195.3.244.42 without over-blocking whole ranges.
@@ -75,20 +76,22 @@ _CDN_STORAGE_HOST = re.compile(
     r"^(sun\d+-\d+|st\d+-\d+)\.(userapi\.com|vk\.ru|vk\.com)$",
     re.I,
 )
-# Long-lived IM / queue sockets: heavy multi fragment often stalls the tab spinner.
+# Long-lived IM / queue sockets + image CDN: heavy multi fragment stalls loads.
 _MESSAGING_HOST = re.compile(
     r"^(im|queuev?\d*|queue|pubsub|notify|sapi)[\.-]",
     re.I,
 )
+_USERAPI_HOST = re.compile(r"(^|\.)userapi\.com$", re.I)
 
 # When a VK CDN IP is firewalled, dial a working peer that still presents
 # a valid cert for the original SNI. Pools are family-specific:
 # userapi.com avatars must NOT fall back to vk.com edges (wrong cert / empty).
 FALLBACK_SEEDS = {
     "userapi": (
-        # Gateway edges: accept other sun*-SNI and 301 → pp.userapi.com (full image).
+        # Gateway edges: accept other sun*-SNI and 301 → ps/pp.userapi.com
         "uk.userapi.com",
         "ppu.userapi.com",
+        "ps.userapi.com",
         "sun1-1.userapi.com",
         "sun1-2.userapi.com",
         "sun1-3.userapi.com",
@@ -124,7 +127,8 @@ FALLBACK_SEEDS = {
     "mycdn": ("mycdn.me",),
     "okcdn": ("okcdn.ru",),
 }
-# Seeds whose IPs 301 foreign sun*-SNI to pp (do NOT put pp/sun9 IPs first).
+# Seeds whose IPs accept foreign sun*-SNI and 301 → ps/pp.
+# Do NOT include ps/pp themselves here — wrong SNI on those IPs breaks TLS.
 _USERAPI_GATEWAY_SEEDS = (
     "uk.userapi.com",
     "ppu.userapi.com",
@@ -459,8 +463,8 @@ def refresh_fallback_pool(kind: str) -> list[str]:
 def fallback_ips_for(host: str) -> list[str]:
     """
     Pick rewrite candidates.
-    For sun*-*.userapi.com: gateway IPs first (301→pp), then same-shard,
-    and keep pp/sun9 IPs last (foreign SNI → 403 → blank avatar).
+    For sun*-*.userapi.com: ONLY gateway IPs (uk/sun1-1 style) that 301→ps/pp.
+    Never dial pp/ps/sun9 with foreign SNI (403 / blur).
     """
     kind = _cdn_family_for(host)
     ips = refresh_fallback_pool(kind)
@@ -469,47 +473,34 @@ def fallback_ips_for(host: str) -> list[str]:
 
     h = host.lower().rstrip(".")
     sk = _shard_key(h)
-    prefer: list[str] = []
-    middle: list[str] = []
-    last: list[str] = []
 
     with _fallback_lock:
         gateway = list(_userapi_gateway_ips)
-        deprioritize = set(_userapi_deprioritize_ips)
         shard = list(_shard_edges.get(sk, [])) if sk else []
 
     if kind == "userapi" and sk and sk.startswith("sun"):
-        for ip in gateway:
-            if ip in ips and ip not in prefer:
-                prefer.append(ip)
-        for ip in shard:
-            if ip in ips and ip not in prefer:
-                prefer.append(ip)
-        for ip in ips:
-            if ip in prefer:
-                continue
-            if ip in deprioritize:
-                last.append(ip)
-            else:
-                middle.append(ip)
-        if len(prefer) > 1:
-            # keep gateway order stable; only shuffle non-gateway prefer tail
-            head = [ip for ip in prefer if ip in gateway]
-            tail = [ip for ip in prefer if ip not in gateway]
-            random.shuffle(tail)
-            prefer = head + tail
-        random.shuffle(middle)
-        random.shuffle(last)
-        return prefer + middle + last
+        ordered: list[str] = []
+        for ip in gateway + shard:
+            if ip in ips and ip not in ordered:
+                ordered.append(ip)
+        # If gateway empty, fall back to any non-deprioritized pool IP
+        if not ordered:
+            with _fallback_lock:
+                bad = set(_userapi_deprioritize_ips)
+            ordered = [ip for ip in ips if ip not in bad]
+            random.shuffle(ordered)
+        return ordered
 
     if sk:
         prefer = [ip for ip in shard if ip in ips]
-    rest = [ip for ip in ips if ip not in prefer]
-    if len(prefer) > 1:
-        random.shuffle(prefer)
-    if len(rest) > 1:
+        rest = [ip for ip in ips if ip not in prefer]
         random.shuffle(rest)
-    return prefer + rest
+        return prefer + rest
+    out = list(ips)
+    random.shuffle(out)
+    return out
+
+
 def is_blocked_ip(ip: str) -> bool:
     ip = str(ip)
     if ip in _runtime_blocked_ips:
@@ -528,14 +519,17 @@ def mark_ip_blocked(ip: str, log: Optional[Callable[[str], None]] = None) -> Non
 
 def _should_learn_native_block(ip: str, host: str) -> bool:
     """
-    Only learn-block CDN storage edges. Never poison core vk/login IPs or
-    shared fallback pools — one transient timeout there kills messaging.
+    Only learn-block CDN storage edges. Never poison working VK edges —
+    one false timeout there rewrites good hosts and blurs every image.
     """
     if any(ip.startswith(p) for p in BLOCKED_IP_PREFIXES):
-        return False  # already covered by prefix
+        return False
+    # Never learn-block known-good VK / userapi ranges
+    if ip.startswith(("87.240.", "93.186.", "185.32.", "95.213.")):
+        return False
     if _CDN_STORAGE_HOST.match(host):
-        return True
-    return ip.startswith("95.142.") or ip.startswith("195.3.244.")
+        return ip.startswith("95.142.") or ip.startswith("195.3.")
+    return False
 
 
 def _dial(ip: str, port: int, family: int = socket.AF_INET) -> socket.socket:
@@ -881,6 +875,7 @@ class FragmentProxy:
             self._thread.join(timeout=2)
 
         self._stop.clear()
+        _runtime_blocked_ips.clear()
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1000,8 +995,15 @@ class FragmentProxy:
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
         if bypass:
-            # IM/queue WebSockets tolerate light split better than multi/fine.
-            mode_override = "split" if _MESSAGING_HOST.match(host) else None
+            # Light split for chat + userapi images; multi is too heavy and
+            # leaves VK stuck on blurry placeholders (full image never arrives).
+            mode_override = None
+            if (
+                _MESSAGING_HOST.match(host)
+                or _USERAPI_HOST.search(host)
+                or _rewritten
+            ):
+                mode_override = "split"
             self._fragment_then_pipe(client, remote, host, mode_override=mode_override)
         else:
             pipe_bidirectional(client, remote)
@@ -1158,8 +1160,8 @@ class App(tk.Tk):
         tk.Label(mode_row, text="分段模式:").pack(side=tk.LEFT)
         self.mode_var = tk.StringVar(value=FRAGMENT_MODE)
         for label, val in (
-            ("中等 multi（推荐）", "multi"),
-            ("稳妥 split", "split"),
+            ("稳妥 split（推荐·图片）", "split"),
+            ("中等 multi", "multi"),
             ("激进 fine（很慢）", "fine"),
         ):
             tk.Radiobutton(
@@ -1363,6 +1365,8 @@ class App(tk.Tk):
 
 def main() -> None:
     app = App()
+    # Auto-start so extension ON is never left pointing at a dead 8888
+    app.after(200, app._start)
     app.mainloop()
 
 
