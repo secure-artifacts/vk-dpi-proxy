@@ -824,6 +824,64 @@ def windows_clear_proxy() -> None:
     _win_inet_refresh()
 
 
+_AUTOSTART_RUN_NAME = "VKDpiBypassProxy"
+_AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _windows_launch_command() -> str:
+    """Command written to HKCU Run for login autostart."""
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+    script = Path(__file__).resolve()
+    py = Path(sys.executable).resolve()
+    # Prefer pythonw.exe so no console flashes at login
+    if py.name.lower() == "python.exe":
+        pythonw = py.with_name("pythonw.exe")
+        if pythonw.is_file():
+            py = pythonw
+    return f'"{py}" "{script}"'
+
+
+def windows_autostart_is_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    import winreg
+
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY, 0, winreg.KEY_READ
+        )
+        try:
+            winreg.QueryValueEx(key, _AUTOSTART_RUN_NAME)
+            return True
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return False
+
+
+def windows_set_autostart(enabled: bool) -> None:
+    if sys.platform != "win32":
+        raise RuntimeError("开机自启仅支持 Windows")
+    import winreg
+
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY, 0, winreg.KEY_SET_VALUE
+    )
+    try:
+        if enabled:
+            winreg.SetValueEx(
+                key, _AUTOSTART_RUN_NAME, 0, winreg.REG_SZ, _windows_launch_command()
+            )
+        else:
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_RUN_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
+
+
 # ---------------------------------------------------------------------------
 # Proxy server
 # ---------------------------------------------------------------------------
@@ -1150,7 +1208,7 @@ class App(tk.Tk):
                 "④ 不用时：插件点「关闭」→ 软件点「停止」\n"
                 "\n"
                 "记住：软件 + 插件 两个都要开。只开一个会转圈或打不开。\n"
-                "不要开系统全局代理。分段模式选「中等 multi」即可。\n"
+                "不要开系统全局代理。分段模式选「稳妥 split」即可。\n"
                 "聊天图若仍模糊：高清文件只在被封节点上时无法拉清，可点图看是否能加载。"
             ),
         ).pack(fill=tk.X)
@@ -1171,6 +1229,21 @@ class App(tk.Tk):
                 value=val,
                 command=self._on_mode,
             ).pack(side=tk.LEFT, padx=(8, 0))
+
+        boot_row = tk.Frame(self, padx=10)
+        boot_row.pack(fill=tk.X, pady=(4, 0))
+        self.autostart_var = tk.BooleanVar(
+            value=windows_autostart_is_enabled() if sys.platform == "win32" else False
+        )
+        self.chk_autostart = tk.Checkbutton(
+            boot_row,
+            text="开机自动启动（登录 Windows 后自动打开并启动代理）",
+            variable=self.autostart_var,
+            command=self._on_autostart_toggle,
+        )
+        self.chk_autostart.pack(side=tk.LEFT)
+        if sys.platform != "win32":
+            self.chk_autostart.configure(state=tk.DISABLED)
 
         self.status = tk.Label(self, text="状态: 已停止", anchor="w", padx=10, fg="#a33")
         self.status.pack(fill=tk.X)
@@ -1208,9 +1281,43 @@ class App(tk.Tk):
         self._ui_log(
             f"[{now()}] 推荐：本软件「启动」+ 浏览器插件「开启」（比系统 PAC 更安全）。"
         )
+        self._ensure_autostart_default()
+
+    def _ensure_autostart_default(self) -> None:
+        """Turn on Windows login autostart once (user can uncheck)."""
+        if sys.platform != "win32":
+            return
+        if windows_autostart_is_enabled():
+            self.autostart_var.set(True)
+            return
+        try:
+            windows_set_autostart(True)
+            self.autostart_var.set(True)
+            self._ui_log(f"[{now()}] 已开启开机自启（取消勾选可关闭）")
+        except Exception as exc:
+            self.autostart_var.set(False)
+            self._ui_log(f"[{now()}] 开机自启设置失败: {exc}")
+
     def _on_mode(self) -> None:
         self.proxy.mode = self.mode_var.get()
         self._ui_log(f"[{now()}] Fragment mode → {self.proxy.mode}")
+
+    def _on_autostart_toggle(self) -> None:
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "开机自启目前仅支持 Windows。")
+            self.autostart_var.set(False)
+            return
+        want = bool(self.autostart_var.get())
+        try:
+            windows_set_autostart(want)
+        except Exception as exc:
+            self.autostart_var.set(windows_autostart_is_enabled())
+            messagebox.showerror("开机自启", str(exc))
+            return
+        if want:
+            self._ui_log(f"[{now()}] 开机自启已开启 → {_windows_launch_command()}")
+        else:
+            self._ui_log(f"[{now()}] 开机自启已关闭")
 
     def _ui_log(self, msg: str) -> None:
         def append() -> None:
