@@ -55,12 +55,17 @@ FRAGMENT_MODE = "split"
 FINE_SIZE = 2
 SPLIT_FIRST = 1
 MULTI_SIZE = 40
+# Image CDN policy (A/B): "none" = opaque CONNECT only (no ClientHello split);
+# "split" = light 2-record split. Never use multi/fine for image CDN.
+IMAGE_CDN_FRAGMENT_MODE = "none"
 
 SO_TIMEOUT = 60
 CONNECT_TIMEOUT = 2.5  # try next IP quickly
 PIPE_IDLE = 600        # longpoll / websocket may sit idle for minutes
 PIPE_BUF = 65536
 HELLO_MAX = 64 * 1024
+# After one side EOF, wait this long for the peer to drain before force-close.
+PIPE_HALF_CLOSE_GRACE = 30.0
 
 # Destination IPs / prefixes that blackhole TCP from this network.
 BLOCKED_IP_PREFIXES = (
@@ -82,6 +87,20 @@ _MESSAGING_HOST = re.compile(
     re.I,
 )
 _USERAPI_HOST = re.compile(r"(^|\.)userapi\.com$", re.I)
+# Photo / static object hosts — treat as image CDN for fragment + diag policy.
+_IMAGE_CDN_HOST = re.compile(
+    r"^(?:"
+    r"(?:sun|st|pp|ps|pu|uk|ppu)\d*(?:-\d+)?\.(?:userapi\.com|vk\.ru|vk\.com)"
+    r"|(?:userapi\.com)"
+    r"|(?:.*\.)?(?:vk-cdn\.(?:net|me)|mycdn\.me|okcdn\.ru)"
+    r")$",
+    re.I,
+)
+# Path prefixes that usually mean photo objects (no query tokens logged).
+_IMAGE_PATH_HINT = re.compile(
+    r"^/(?:impg|s|c\d+|v\d+|images?|photo|docs?|mail|wk|video|audio)/",
+    re.I,
+)
 
 # When a VK CDN IP is firewalled, dial a working peer that still presents
 # a valid cert for the original SNI. Pools are family-specific:
@@ -243,6 +262,96 @@ def is_target_host(host: str) -> bool:
     except ValueError:
         pass
     return any(h == s or h.endswith("." + s) for s in TARGET_SUFFIXES)
+
+
+def is_image_cdn_host(host: str) -> bool:
+    h = host.lower().rstrip(".").split(":")[0]
+    if _IMAGE_CDN_HOST.match(h):
+        return True
+    if _CDN_STORAGE_HOST.match(h):
+        return True
+    if _USERAPI_HOST.search(h) and not _MESSAGING_HOST.match(h):
+        return True
+    return False
+
+
+def is_messaging_host(host: str) -> bool:
+    return bool(_MESSAGING_HOST.match(host.lower().rstrip(".")))
+
+
+def host_traffic_class(host: str) -> str:
+    """Classify CONNECT host for fragment / logging policy."""
+    h = host.lower().rstrip(".")
+    if is_messaging_host(h):
+        return "messaging"
+    if is_image_cdn_host(h):
+        return "image_cdn"
+    if is_target_host(h):
+        return "vk_other"
+    return "pass"
+
+
+def resolve_fragment_mode(host: str, gui_mode: str) -> str:
+    """
+    Per-host TLS ClientHello fragmentation.
+    Image CDN defaults to IMAGE_CDN_FRAGMENT_MODE (none|split) — never multi/fine.
+    Messaging always light split. Other VK hosts use GUI mode.
+    """
+    kind = host_traffic_class(host)
+    if kind == "image_cdn":
+        mode = (IMAGE_CDN_FRAGMENT_MODE or "none").lower()
+        return mode if mode in ("none", "split") else "none"
+    if kind == "messaging":
+        return "split"
+    if kind == "vk_other":
+        return gui_mode if gui_mode in ("split", "multi", "fine") else "split"
+    return "none"
+
+
+def sanitize_url_for_log(url_or_path: str) -> str:
+    """
+    Privacy-safe path type for logs: host class + path prefix only.
+    Strips query (tokens), fragments, and deep object ids when possible.
+    """
+    raw = (url_or_path or "").strip()
+    if not raw:
+        return "-"
+    try:
+        if "://" in raw:
+            parts = urlsplit(raw)
+            path = parts.path or "/"
+        else:
+            path = raw.split("?", 1)[0]
+    except Exception:
+        path = "/"
+    # Collapse numeric/object segments: /impg/xxx → /impg/*, /s/… → /s/*
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "/"
+    head = segs[0]
+    if _IMAGE_PATH_HINT.match("/" + head + "/"):
+        return f"/{head}/*"
+    if len(segs) == 1:
+        return f"/{head}"
+    return f"/{head}/…"
+
+
+def classify_close_error(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return "ok"
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in msg:
+        return "timeout"
+    if "reset" in msg or getattr(exc, "winerror", None) == 10054:
+        return "reset"
+    if "eof" in msg or "broken pipe" in msg:
+        return "eof"
+    if isinstance(exc, ConnectionResetError):
+        return "reset"
+    if isinstance(exc, BrokenPipeError):
+        return "eof"
+    return f"err:{name}"
 
 
 def recv_until(sock: socket.socket, marker: bytes, limit: int = 65536) -> bytes:
@@ -469,7 +578,10 @@ def fallback_ips_for(host: str) -> list[str]:
     kind = _cdn_family_for(host)
     ips = refresh_fallback_pool(kind)
     if kind in ("mycdn", "okcdn") and not ips:
-        ips = refresh_fallback_pool("vk")
+        # Do NOT cross-family into userapi — wrong cert / empty bodies.
+        # Only allow vk-family seeds for mycdn/okcdn as last resort when empty.
+        alt = refresh_fallback_pool("vk")
+        ips = [ip for ip in alt if not is_blocked_ip(ip)]
 
     h = host.lower().rstrip(".")
     sk = _shard_key(h)
@@ -653,36 +765,90 @@ def _connect_fallback(
     )
 
 
-def pipe_bidirectional(a: socket.socket, b: socket.socket) -> None:
-    """Relay bytes both ways. Idle is normal for VK longpoll / WebSocket."""
-    # Blocking sockets: a 60s SO_TIMEOUT during idle longpoll kills Messages.
+def pipe_bidirectional(
+    a: socket.socket,
+    b: socket.socket,
+    on_close: Optional[Callable[[str, Optional[BaseException]], None]] = None,
+) -> None:
+    """
+    Relay bytes both ways with half-close.
+    One-sided EOF shuts down the peer write side and keeps draining the
+    other direction so a large image response is not truncated early.
+    """
     for s in (a, b):
         try:
             s.settimeout(None)
         except OSError:
             pass
+
     sockets = [a, b]
+    last_exc: Optional[BaseException] = None
+    reason = "idle-or-peer"
+    half_closed_at: Optional[float] = None
+
     try:
-        while True:
-            readable, _, errored = select.select(sockets, [], sockets, PIPE_IDLE)
+        while sockets:
+            timeout = PIPE_IDLE
+            if half_closed_at is not None:
+                remaining = PIPE_HALF_CLOSE_GRACE - (time.time() - half_closed_at)
+                if remaining <= 0:
+                    reason = "half-close-grace"
+                    break
+                timeout = min(timeout, remaining)
+
+            readable, _, errored = select.select(sockets, [], sockets, timeout)
             if errored:
-                return
+                reason = "select-error"
+                break
             if not readable:
+                if half_closed_at is not None:
+                    reason = "half-close-idle"
+                    break
                 continue
-            for s in readable:
+
+            for s in list(readable):
+                if s not in sockets:
+                    continue
                 other = b if s is a else a
                 try:
                     data = s.recv(PIPE_BUF)
-                except OSError:
-                    return
+                except OSError as exc:
+                    last_exc = exc
+                    reason = classify_close_error(exc)
+                    sockets = []
+                    break
                 if not data:
-                    return
+                    # Half-close: stop reading this side; allow peer→client drain.
+                    try:
+                        other.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    try:
+                        sockets.remove(s)
+                    except ValueError:
+                        pass
+                    if half_closed_at is None:
+                        half_closed_at = time.time()
+                        reason = "eof-half-close"
+                    if not sockets:
+                        reason = "eof-both"
+                    continue
                 try:
                     other.sendall(data)
-                except OSError:
-                    return
-    except Exception:
-        return
+                except OSError as exc:
+                    last_exc = exc
+                    reason = classify_close_error(exc)
+                    sockets = []
+                    break
+    except Exception as exc:
+        last_exc = exc
+        reason = classify_close_error(exc)
+
+    if on_close:
+        try:
+            on_close(reason, last_exc)
+        except Exception:
+            pass
 
 
 def parse_http_host(req: bytes) -> tuple[str, int]:
@@ -1045,26 +1211,63 @@ class FragmentProxy:
         self, client: socket.socket, host: str, port: int, active: int
     ) -> Optional[socket.socket]:
         bypass = is_target_host(host)
-        mode = "FRAGMENT" if bypass else "PASS"
-        self.log(f"[{now()}] [{mode}] CONNECT {host}:{port}  (active={active})")
+        traffic = host_traffic_class(host)
+        is_img = traffic == "image_cdn"
+        mode_tag = "FRAGMENT" if bypass else "PASS"
+        t0 = time.perf_counter()
+        self.log(
+            f"[{now()}] [{mode_tag}] CONNECT {host}:{port}  "
+            f"class={traffic}  (active={active})"
+        )
 
-        remote, _rewritten = connect_remote(host, port, self.log)
+        remote: Optional[socket.socket] = None
+        rewritten = False
+        try:
+            remote, rewritten = connect_remote(host, port, self.log)
+        except OSError as exc:
+            ms = int((time.perf_counter() - t0) * 1000)
+            if is_img:
+                self.log(
+                    f"[{now()}] [IMG-DIAG] host={host} class={traffic} "
+                    f"image_cdn=1 fallback=0 fragment=n/a "
+                    f"connect_ms={ms} close={classify_close_error(exc)} path=-"
+                )
+            self.log(f"[{now()}] CONNECT fail {host}: {exc}")
+            raise
+
+        connect_ms = int((time.perf_counter() - t0) * 1000)
         self._track(remote)
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
+        frag_mode = "none"
         if bypass:
-            # Light split for chat + userapi images; multi is too heavy and
-            # leaves VK stuck on blurry placeholders (full image never arrives).
-            mode_override = None
-            if (
-                _MESSAGING_HOST.match(host)
-                or _USERAPI_HOST.search(host)
-                or _rewritten
-            ):
-                mode_override = "split"
-            self._fragment_then_pipe(client, remote, host, mode_override=mode_override)
+            frag_mode = resolve_fragment_mode(host, self.mode)
+            # Rewritten CDN edges still need light split if policy is none and
+            # the path is SNI-sensitive — keep rewrite on split at minimum when
+            # GUI is multi/fine would have been applied historically.
+            if rewritten and frag_mode == "none":
+                # A/B: still allow none; DPI on fallback IP is usually weaker.
+                pass
+            self._fragment_then_pipe(
+                client,
+                remote,
+                host,
+                mode_override=frag_mode,
+                image_diag={
+                    "class": traffic,
+                    "image_cdn": is_img,
+                    "fallback": rewritten,
+                    "connect_ms": connect_ms,
+                },
+            )
         else:
-            pipe_bidirectional(client, remote)
+            def _on_close(reason: str, exc: Optional[BaseException]) -> None:
+                self.log(
+                    f"[{now()}] [PIPE] host={host} close={reason} "
+                    f"detail={classify_close_error(exc)}"
+                )
+
+            pipe_bidirectional(client, remote, on_close=_on_close)
         return remote
 
     def _handle_http(
@@ -1073,6 +1276,7 @@ class FragmentProxy:
         """
         Forward plain HTTP. For VK hosts, 302 → HTTPS avoids broken http auth loops
         when the browser still probes http://login.vk.ru.
+        Never mutates response bodies for image (or any) content.
         """
         try:
             host, port = parse_http_host(req)
@@ -1111,7 +1315,7 @@ class FragmentProxy:
                 b"Connection: close\r\n"
                 b"Content-Length: 0\r\n\r\n"
             )
-            self.log(f"[{now()}] [HTTP→HTTPS] {host}{path}")
+            self.log(f"[{now()}] [HTTP→HTTPS] {host}{sanitize_url_for_log(path)}")
             return None
 
         self.log(f"[{now()}] [HTTP-PASS] {host}:{port}  (active={active})")
@@ -1127,29 +1331,86 @@ class FragmentProxy:
         remote: socket.socket,
         host: str,
         mode_override: Optional[str] = None,
+        image_diag: Optional[dict] = None,
     ) -> None:
+        diag = image_diag or {}
+        close_reason = "start"
+        close_exc: Optional[BaseException] = None
+        frag_applied = "none"
         try:
             first = recv_tls_records(client)
         except OSError as exc:
+            close_reason = classify_close_error(exc)
             self.log(f"[{now()}] No ClientHello for {host}: {exc}")
+            self._log_img_diag(host, diag, frag_applied, close_reason)
             return
         if not first:
+            close_reason = "eof"
+            self._log_img_diag(host, diag, frag_applied, close_reason)
             return
 
-        mode = mode_override or self.mode
-        if first[0:1] == b"\x16":
-            parts = fragment_client_hello(first, mode)
-            self.log(
-                f"[{now()}] Fragmented → {host} "
-                f"({len(first)} B → {len(parts)} rec, mode={mode})"
-            )
-            if self._stop.is_set():
-                return
-            send_parts(remote, parts)
-        else:
-            remote.sendall(first)
+        mode = mode_override if mode_override is not None else self.mode
+        try:
+            if first[0:1] == b"\x16" and mode not in ("none", "pass", ""):
+                parts = fragment_client_hello(first, mode)
+                frag_applied = mode
+                self.log(
+                    f"[{now()}] Fragmented → {host} "
+                    f"({len(first)} B → {len(parts)} rec, mode={mode})"
+                )
+                if self._stop.is_set():
+                    close_reason = "stop"
+                    self._log_img_diag(host, diag, frag_applied, close_reason)
+                    return
+                send_parts(remote, parts)
+            else:
+                frag_applied = "none"
+                if first[0:1] == b"\x16":
+                    self.log(
+                        f"[{now()}] [NO-FRAG] → {host} "
+                        f"({len(first)} B ClientHello opaque forward)"
+                    )
+                remote.sendall(first)
 
-        pipe_bidirectional(client, remote)
+            def _on_close(reason: str, exc: Optional[BaseException]) -> None:
+                nonlocal close_reason, close_exc
+                close_reason = reason
+                close_exc = exc
+
+            pipe_bidirectional(client, remote, on_close=_on_close)
+        except OSError as exc:
+            close_reason = classify_close_error(exc)
+            close_exc = exc
+        finally:
+            self._log_img_diag(
+                host,
+                diag,
+                frag_applied,
+                close_reason,
+                close_exc,
+            )
+
+    def _log_img_diag(
+        self,
+        host: str,
+        diag: dict,
+        frag: str,
+        close_reason: str,
+        close_exc: Optional[BaseException] = None,
+    ) -> None:
+        traffic = diag.get("class") or host_traffic_class(host)
+        is_img = bool(diag.get("image_cdn", traffic == "image_cdn"))
+        if not is_img and traffic != "messaging":
+            # Still log brief pipe close for rewritten CDN-ish hosts
+            if not diag:
+                return
+        detail = classify_close_error(close_exc) if close_exc else close_reason
+        self.log(
+            f"[{now()}] [IMG-DIAG] host={host} class={traffic} "
+            f"image_cdn={int(is_img)} fallback={int(bool(diag.get('fallback')))} "
+            f"fragment={frag} connect_ms={diag.get('connect_ms', '-')} "
+            f"close={close_reason} detail={detail} path=-"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1245,6 +1506,22 @@ class App(tk.Tk):
         if sys.platform != "win32":
             self.chk_autostart.configure(state=tk.DISABLED)
 
+        img_row = tk.Frame(self, padx=10)
+        img_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(img_row, text="图片 CDN 分片:").pack(side=tk.LEFT)
+        self.img_frag_var = tk.StringVar(value=IMAGE_CDN_FRAGMENT_MODE)
+        for label, val in (
+            ("不分片 none（推荐·A/B）", "none"),
+            ("轻量 split", "split"),
+        ):
+            tk.Radiobutton(
+                img_row,
+                text=label,
+                variable=self.img_frag_var,
+                value=val,
+                command=self._on_img_frag,
+            ).pack(side=tk.LEFT, padx=(8, 0))
+
         self.status = tk.Label(self, text="状态: 已停止", anchor="w", padx=10, fg="#a33")
         self.status.pack(fill=tk.X)
 
@@ -1301,6 +1578,13 @@ class App(tk.Tk):
     def _on_mode(self) -> None:
         self.proxy.mode = self.mode_var.get()
         self._ui_log(f"[{now()}] Fragment mode → {self.proxy.mode}")
+
+    def _on_img_frag(self) -> None:
+        global IMAGE_CDN_FRAGMENT_MODE
+        IMAGE_CDN_FRAGMENT_MODE = self.img_frag_var.get()
+        self._ui_log(
+            f"[{now()}] Image CDN fragment policy → {IMAGE_CDN_FRAGMENT_MODE}"
+        )
 
     def _on_autostart_toggle(self) -> None:
         if sys.platform != "win32":
